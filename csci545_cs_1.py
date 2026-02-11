@@ -1,17 +1,21 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
 import numpy as np
 import plotly.graph_objs as go
 from dash import Dash, dcc, html, Input, Output
-import json
-from optimizers import FireflyOptimizer
+import os
+import math
+from geomloss import SamplesLoss
+from optimizers import FireflyOptimizer, contrastive_divergence_training
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 class GAUSS_EBM(nn.Module):
     def __init__(self, visible_dim, hidden_dim, sharp_sig_temp=0.7, dropout_p=0.3, weight_decay=0.0, sigma=1.0):
         super(GAUSS_EBM, self).__init__()
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device
 
         self.num_visible = visible_dim
         self.num_hidden = hidden_dim
@@ -96,160 +100,6 @@ class GAUSS_EBM(nn.Module):
 
     def forward(self, v):
         return self.sample_hidden(v)
-
-def contrastive_divergence_training(dataloader,
-                                    rbm,
-                                    k=1,
-                                    epochs=1000,
-                                    lr=1e-2,
-                                    batch_size=64,
-                                    #device=None,
-                                    persistent=False,
-                                    lr_momentum=0.0,
-                                    weight_decay=0.0,
-                                    use_optimizer=False,
-                                    verbose=True,
-                                    clamp_visible=True):
-
-    xs = []
-    count = 0
-    for batch in dataloader:
-        if isinstance(batch, (list, tuple)):
-            x = batch[0]
-        else:
-            x = batch
-        xs.append(x)
-
-    x_all = torch.cat(xs, dim=0).to(device)
-    if isinstance(dataloader, torch.Tensor):
-        dataset_tensor = dataloader.to(device)
-        def _iter_loader():
-            n = dataset_tensor.size(0)
-            for i in range(0, n, batch_size):
-                yield dataset_tensor[i:i+batch_size]
-        loader = _iter_loader()
-        loader_factory = lambda: _iter_loader()
-    else:
-        loader_factory = lambda: dataloader
-
-    logs = defaultdict(list)
-    best_recon = float('inf')
-
-    v_W = torch.zeros_like(rbm.W.data, device=device)
-    v_vb = torch.zeros_like(rbm.v_bias.data, device=device)
-    v_hb = torch.zeros_like(rbm.h_bias.data, device=device)
-    persistent_chain = None
-    eps = 1e-6
-
-    for epoch in range(epochs):
-        t0 = time.time()
-        epoch_recon = []
-        epoch_w_update_norms = []
-
-        loader = loader_factory()
-        for batch in loader:
-            if isinstance(batch, (tuple, list)):
-                batch = batch[0]
-            batch = batch.to(device).float()
-
-            if rbm_param == 'bern' and clamp_visible:
-                batch = batch.clamp(eps, 1 - eps)
-
-            b = batch.size(0)
-
-            pos_h_prob, pos_h_sample = rbm.sample_hidden(batch)
-            pos_assoc = torch.matmul(batch.t(), pos_h_prob)
-            pos_h_mean = pos_h_prob.mean(dim=0)
-            pos_v_mean = batch.mean(dim=0)
-
-            if persistent and persistent_chain is not None:
-                v_neg = persistent_chain
-            else:
-                v_neg = batch.clone().detach()
-
-            for _step in range(k):
-                v_neg = rbm.gibbs_step(v_neg)
-                if rbm_param == 'bern' and clamp_visible:
-                    v_neg = v_neg.clamp(eps, 1 - eps)
-                
-            if persistent:
-                persistent_chain = v_neg.detach()
-
-            neg_h_prob_final, _ = rbm.sample_hidden(v_neg)
-                
-            neg_assoc = torch.matmul(v_neg.t(), neg_h_prob_final)  # (V, H)
-            neg_h_mean = neg_h_prob_final.mean(dim=0)
-            neg_v_mean = v_neg.mean(dim=0)
-
-            grad_hb = (pos_h_mean - neg_h_mean)
-
-            #elif rbm_param == 'gauss':
-            sigma2 = rbm.sigma ** 2
-            grad_W = (pos_assoc - neg_assoc) / (float(b) * sigma2.unsqueeze(1))
-            grad_vb = (pos_v_mean - neg_v_mean) / sigma2
-            grad_W = grad_W - rbm.weight_decay * rbm.W.data
-
-            if use_optimizer and hasattr(rbm, 'optimizer') and rbm.optimizer is not None:
-                opt = rbm.optimizer
-                opt_lr = opt.param_groups[0]['lr'] if 'lr' in opt.param_groups[0] else 1.0
-                opt.zero_grad()
-                rbm.W.grad = - (grad_W / (opt_lr if opt_lr != 0 else 1.0))
-                rbm.v_bias.grad = - (grad_vb / (opt_lr if opt_lr != 0 else 1.0))
-                rbm.h_bias.grad = - (grad_hb / (opt_lr if opt_lr != 0 else 1.0))
-                opt.step()
-                update_norm = torch.norm(torch.stack([
-                        (opt_lr * rbm.W.grad).view(-1),
-                        (opt_lr * rbm.v_bias.grad).view(-1),
-                        (opt_lr * rbm.h_bias.grad).view(-1)
-                ]))
-            else:
-                v_W = lr_momentum * v_W + lr * grad_W
-                v_vb = lr_momentum * v_vb + lr * grad_vb
-                v_hb = lr_momentum * v_hb + lr * grad_hb
-                rbm.W.data.add_(v_W)
-                rbm.v_bias.data.add_(v_vb)
-                rbm.h_bias.data.add_(v_hb)
-                update_norm = torch.norm(torch.cat([
-                        v_W.view(-1),
-                        v_vb.view(-1),
-                        v_hb.view(-1)
-                ]))
-            with torch.no_grad():
-                recon_h_prob, h_sample = rbm.sample_hidden(batch)
-                recon_v_prob, _ = rbm.sample_visible(recon_h_prob)
-                recon_err = torch.mean((batch - recon_v_prob)**2)
-                if isinstance(recon_err, torch.Tensor):
-                    recon_err = recon_err.detach().cpu().numpy()
-                epoch_recon.append(recon_err)
-                epoch_w_update_norms.append(update_norm.item())
-
-        epoch_time = time.time() - t0
-
-        epoch_recon = np.asarray(epoch_recon)
-        mean_recon = float(np.mean(epoch_recon)) if len(epoch_recon)>0 else 0.0
-        mean_update_norm = float(np.mean(epoch_w_update_norms)) if epoch_w_update_norms else 0.0
-
-        logs['epoch'].append(epoch)
-        #logs['free_energy'].append(rbm.energy(x_all).mean().item())
-        logs['energy_diff'].append(rbm.compute_energy_gap(x_all)[2])
-        logs['recon_error'].append(mean_recon)
-        logs['update_norm'].append(mean_update_norm)
-        logs['epoch_time_s'].append(epoch_time)
-
-        if verbose:
-            print(f"[CD-k][{rbm_param}] Epoch {epoch+1}/{epochs} | energy_diff {logs['energy_diff'][-1]:.6e} | recon_mse {mean_recon:.6e} | avg_update_norm {mean_update_norm:.6e} | time {epoch_time:.2f}s")
-        if np.isnan(logs['energy_diff'][-1]):
-            return rbm, dict(logs)
-        if mean_recon < best_recon:
-            best_recon = mean_recon
-            count = 0
-        else:
-            count += 1
-
-        #if count >= 50:
-        #    print("EARLY STOP TRIGGERED")
-        #    return rbm, dict(logs)
-
 
 class EBMVisualizer:
     def __init__(self, data_points, energies):
@@ -428,9 +278,6 @@ def make_dataset_counts(n_samples=10000, n_features=64, kind='factor',
         raise ValueError(f"Unknown dataset kind: {kind}")
 
 def get_dataloader(data: torch.Tensor, batch_size: int = 64, shuffle: bool = True, drop_last: bool = True):
-    """
-    Wrap a tensor into a DataLoader. Expects data as torch.Tensor (N, D).
-    """
     ds = TensorDataset(data)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last)
 
@@ -448,43 +295,28 @@ def save_dataset(data: torch.Tensor, path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(data, path)
 
-def save_and_plot_histories(firefly_positions_history, fitness_history, alpha_history, objectives_history, output_prefix="firefly_results"):
-    pos_df = pd.DataFrame.from_dict(firefly_positions_history, orient="index")
-    pos_df.to_csv(f"{output_prefix}/firefly_positions.csv", index_label="Iteration")
-
-    fit_df = pd.DataFrame.from_dict(fitness_history, orient="index")
-    fit_df.to_csv(f"{output_prefix}/fitness.csv", index_label="Iteration")
-
-    alpha_df = pd.DataFrame.from_dict(alpha_history, orient="index")
-    alpha_df.to_csv(f"{output_prefix}/alpha.csv", index_label="Iteration")
-
-    objectives_df = pd.DataFrame.from_dict(objectives_history, orient='index')
-    objectives_df.to_csv(f'{output_prefix}/objectives.csv', index_label='Iteration')
-
-    fig = go.Figure()
-
-    avg_fitness = fit_df.mean(axis=1)
-    fig.add_trace(go.Scatter(
-        y=avg_fitness,
-        mode='lines',
-        name='Average Fitness'
-    ))
-
-    avg_alpha = alpha_df.mean(axis=1)
-    fig.add_trace(go.Scatter(
-        y=avg_alpha,
-        mode='lines',
-        name='Average Alpha'
-    ))
-
-    fig.update_layout(
-        title="Firefly Algorithm Optimization",
-        xaxis_title="Iteration",
-        yaxis_title="Value",
-        template="plotly_white"
+def total_correlation(v, encoder, dataset_size=None):
+    h_logits, h = encoder.sample_hidden(v)
+    B, H = h.shape
+    N = dataset_size if dataset_size else B
+    logN = math.log(N)
+    log_q_h_given_x = (
+            h.unsqueeze(1) * (-F.softplus(-h).unsqueeze(0)) +
+            (1 - h.unsqueeze(1)) * (-F.softplus(h).unsqueeze(0))
+    ).sum(dim=2)
+    log_q_h = torch.logsumexp(log_q_h_given_x, dim=1) - logN
+    log_q_hj = (
+            h.unsqueeze(1) * (-F.softplus(-h).unsqueeze(0)) +
+            (1 - h.unsqueeze(1)) * (-F.softplus(h).unsqueeze(0))
     )
+    log_q_hj = torch.logsumexp(log_q_hj, dim=1) - logN
+    tc = (log_q_h - log_q_hj.sum(dim=1)).mean()
+    return tc
 
-    pyo.plot(fig, filename=f"{output_prefix}/optimization_results.html", auto_open=False)
+def em_loss(decoding, data):
+    sinkhorn = SamplesLoss(loss="sinkhorn", p=2, blur=0.05)
+    em = sinkhorn(decoding, data)
+    return em.detach().cpu().numpy()
 
 def rbm_evaluation(encoder, x, compute_lam=False, eps=1e-8):
     v_recon, h_sample = encoder.forward(x)
@@ -507,11 +339,14 @@ def rbm_evaluation(encoder, x, compute_lam=False, eps=1e-8):
 
 if __name__ == "__main__":
     num_features = 2
-    data = make_dataset_counts(n_samples=2000, n_features=num_features, kind='mixture', sparsity=1, seed=42, n_modes=8, base_rate=2.0, rate_variation=0.7)
+    data = make_dataset_counts(n_samples=50, n_features=num_features, kind='mixture', sparsity=.4, seed=42, n_modes=4, base_rate=2.0, rate_variation=0.7)
     ebm = GAUSS_EBM(num_features, 1)
     ff_opt = FireflyOptimizer(rbm_evaluation, ebm, data, 'gauss', 20, 20)
-
-    
-
+    hyperparams = ff_opt.optimize()
+    ebm.reinitialize(num_features, 1, hyperparams[2], hyperparams[3], hyperparams[4], hyperparams[5])
+    dataloader = get_dataloader(data, int(hyperparams[6]))
+    ebm, logs = contrastive_divergence_training(dataloader, ebm)
+    energies = ebm.energy(data)
+    energies = energies.detach().cpu().numpy()
     viz = EBMVisualizer(data, energies)
     viz.run()
